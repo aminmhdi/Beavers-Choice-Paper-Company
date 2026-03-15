@@ -40,7 +40,7 @@ The system is designed around an **orchestrator + specialist worker agents**. In
    - Validates stock, records sales transactions, and can produce financial summaries.
    - Estimates supplier delivery dates based on order size.
 
-> Note: The evaluation runner in `project_starter.py` currently instantiates `OrchestrationAgent` per request and relies on tool‑calling to complete the workflow. The worker agent classes are included to keep responsibilities explicit and to support stricter “orchestrator delegates to workers” setups.
+> Note: The evaluation runner in `project_starter.py` instantiates the worker agents and passes them into `OrchestrationAgent` via `managed_agents`, so the orchestrator delegates inventory checks, quote generation, and sales processing to distinct specialist agents.
 
 ---
 

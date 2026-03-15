@@ -362,7 +362,7 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
                 ELSE 0
             END), 0) AS current_stock
         FROM transactions
-        WHERE item_name = :item_name
+        WHERE lower(item_name) = lower(:item_name)
         AND transaction_date <= :as_of_date
     """
 
@@ -870,18 +870,18 @@ class InventoryAgent(ToolCallingAgent):
 class QuotingAgent(ToolCallingAgent):
     def __init__(self, model):
         super().__init__(
-            tools=[search_quote_history_tool, get_catalog_items, check_item_stock, check_all_inventory],
+            tools=[search_quote_history_tool, get_catalog_items],
             model=model,
             name="quoting_agent",
             description=(
                 "Responsible for generating quotes for customer requests based on inventory levels and past quote history. "
                 "Uses the 'search_quote_history_tool' to find past quotes, 'get_catalog_items' to retrieve catalog information, "
-                "'check_item_stock' to verify item availability, and 'check_all_inventory' for a comprehensive view of inventory."
+                "and relies on the orchestration agent to provide availability information from the inventory agent."
             ),
             instructions=(
                 "You are a quoting agent for Beaver's Choice Paper Company\n"
                 "When given a customer request: \n"
-                "1. Check which requested items are available in inventory using check_all_inventory and check_item_stock tools.\n"
+                "1. Assume the orchestration agent provides an availability summary (from the inventory agent).\n"
                 "2. Look up catalog information using the get_catalog_items tool.\n"
                 "3. Search quote history for similar requests using search_quote_history_tool to inform your quoting decisions.\n"
                 "4. Apply discounts based on order size and customer history:\n"
@@ -902,24 +902,24 @@ class QuotingAgent(ToolCallingAgent):
 class SalesAgent(ToolCallingAgent):
     def __init__(self, model):
         super().__init__(
-            tools=[process_sale, check_cash_balance, generate_financial_report_tool, estimate_supplier_delivery_date, check_item_stock],
+            tools=[process_sale, check_cash_balance, generate_financial_report_tool, estimate_supplier_delivery_date],
             model=model,
             name="sales_agent",
             description=(
                 "Responsible for processing sales transactions, updating inventory, and managing cash flow. "
                 "Uses the 'process_sale' tool to record sales, 'check_cash_balance' to monitor cash levels, "
                 "'generate_financial_report_tool' to create financial reports, 'estimate_supplier_delivery_date' to predict delivery times, "
-                "and 'check_item_stock' to verify inventory availability."
+                "and relies on the orchestration agent to provide availability context from the inventory agent when needed."
             ),
             instructions=(
                 "You are a sales agent for Beaver's Choice Paper Company\n"
                 "When processing a sale:\n"
-                "1. Verify the item is in stock using check_item_stock.\n"
-                "2. If stock is sufficient, use process_sale to record the transaction and update inventory.\n"
-                "3. After processing the sale, check the updated cash balance using check_cash_balance.\n"
+                "1. If the orchestration agent provides an availability summary, use it to guide what you attempt to sell.\n"
+                "2. Use process_sale to record each in-stock line-item transaction and update inventory.\n"
+                "3. After processing sales, check the updated cash balance using check_cash_balance.\n"
                 "4. Generate a financial report using generate_financial_report_tool to assess the impact of\n"
                 "   the sale on overall finances.\n"
-                "5. If the sale depletes stock below minimum levels, use estimate_supplier_delivery\n"
+                "5. If the sale depletes stock below minimum levels, use estimate_supplier_delivery_date\n"
                 "   to inform the customer of expected restock times.\n"
                 "6. Always provide clear and informative responses to the customer regarding their purchase and any relevant\n"
                 "   inventory or financial information, without revealing internal tool usage.\n"
@@ -930,9 +930,9 @@ class SalesAgent(ToolCallingAgent):
 
 # Orchestration Agent: manage the flow of information between the inventory, quoting, and sales agents to handle customer requests end-to-end.
 class OrchestrationAgent(ToolCallingAgent):
-    def __init__(self, model):
+    def __init__(self, model, managed_agents=None):
         super().__init__(
-            tools=[check_all_inventory, check_item_stock, search_quote_history_tool, get_catalog_items, process_sale, check_cash_balance, generate_financial_report_tool, estimate_supplier_delivery_date],
+            tools=[],
             model=model,
             name="orchestration_agent",
             description=(
@@ -944,10 +944,11 @@ class OrchestrationAgent(ToolCallingAgent):
                 "When given a customer request, you will:\n\n"
                 
                 "1. Understand: Parse the customer request to identify the items, quantities, and any specific requirements.\n"
-                "2. Coordinate: Work with the quoting agent to generate an appropriate quote based on inventory and past quote history.\n"
-                "3. Generate Quote: Ensure the quote is clear, concise, and customer-facing, without revealing internal tool usage or inventory details.\n"
-                "4. Fulfill Order: ask sales agent to process the sale for in-stock items and estimate delivery.\n"
-                "5. Respond: Provide the customer with a clear response that includes the quote and any relevant information about stock availability, delivery times, and financial details.\n" \
+                "2. Delegate Inventory: Call the managed agent 'inventory_agent' to check stock availability as of the request date.\n"
+                "   - Call it as a tool with a JSON payload containing at least a 'task' string.\n"
+                "3. Delegate Quoting: Call the managed agent 'quoting_agent' with the customer request + the inventory availability summary.\n"
+                "4. Delegate Sales: If the request should be fulfilled now (default: yes for purchase-like requests), call the managed agent 'sales_agent' with the request date + the quote details and ask it to process the sale(s).\n"
+                "5. Respond: Provide the customer with a clear response that includes the quote and any relevant information about stock availability and delivery times.\n" \
                 "   - Itemized quote (quantity, unit price, discount, total price)\n"
                 "   - Which items are fulfilled with expected delivery times\n"
                 "   - Which items cannot be fulfilled and the reasons why\n"
@@ -959,11 +960,14 @@ class OrchestrationAgent(ToolCallingAgent):
                 "  'Need 200 sheets of glossy paper' -> 'Glossy Paper' with quantity 200\n" \
                 "  'Looking for 100 sheets of recycled paper' -> 'Recycled Paper' with quantity 100\n" \
                 "  'Construction paper for a school project, need 300 sheets' -> 'Construction Paper' with quantity 300\n" \
-                "- Always check inventory before quoting. If items are out of stock, state they cannot be fulfilled. Do not include out-of-stock items in the quote.\n" \
+                "- Always delegate inventory checks to the inventory_agent before quoting.\n" \
+                "- Always delegate quote generation to the quoting_agent.\n" \
+                "- Always delegate sale processing to the sales_agent (do not call sales/inventory tools directly).\n" \
                 "- Be professional and clear in all customer communications, providing detailed information about the quote and order status without revealing internal processes or tool usage. \n" \
                 "- Never reveal internal tool usage or inventory details in the quote explanation. The quote should be customer-facing and focused on the request and pricing. \n"
                 "- Provide clear and informative responses to the customer regarding their inquiry, including any relevant inventory or financial information, without revealing internal tool usage or internal processes."
             ),
+            managed_agents=managed_agents,
             max_steps=20
         )
 
@@ -1008,7 +1012,14 @@ def run_test_scenarios():
 
         # Process request
         request_with_date = f"{row['request']} (Date of request: {request_date})"
-        orchestration_agent = OrchestrationAgent(model)
+        inventory_agent = InventoryAgent(model)
+        quoting_agent = QuotingAgent(model)
+        sales_agent = SalesAgent(model)
+
+        orchestration_agent = OrchestrationAgent(
+            model,
+            managed_agents=[inventory_agent, quoting_agent, sales_agent],
+        )
 
         try:
             response = orchestration_agent.run(request_with_date)
